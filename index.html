@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Vibe Trading 数据看板</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e8e8e8;
+        }
+        .header {
+            text-align: center;
+            padding: 30px 20px;
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .header h1 {
+            font-size: 2.2em;
+            font-weight: 600;
+            background: linear-gradient(90deg, #00d4aa, #7b68ee, #f0b90b);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #888;
+            font-size: 0.95em;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #7b68ee;
+        }
+        .loading-spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(123, 104, 238, 0.3);
+            border-radius: 50%;
+            border-top-color: #7b68ee;
+            animation: spin 1s ease-in-out infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            padding: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+        }
+        .stat-card h3 {
+            font-size: 0.85em;
+            color: #888;
+            margin-bottom: 8px;
+            font-weight: 400;
+        }
+        .stat-card .value {
+            font-size: 1.8em;
+            font-weight: 700;
+            color: #fff;
+        }
+        .stat-card .sub {
+            font-size: 0.75em;
+            color: #666;
+            margin-top: 5px;
+        }
+        .stat-card.binance .value { color: #F0B90B; }
+        .stat-card.okx .value { color: #fff; }
+        .stat-card.bitmart .value { color: #00D4AA; }
+        .stat-card.hyperliquid .value { color: #7B68EE; }
+        .chart-container {
+            background: rgba(255,255,255,0.03);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px;
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+        .chart-title {
+            font-size: 1.1em;
+            font-weight: 500;
+            margin-bottom: 15px;
+            padding-left: 10px;
+            border-left: 3px solid #7b68ee;
+        }
+        .error-msg {
+            background: rgba(255,100,100,0.1);
+            border: 1px solid rgba(255,100,100,0.3);
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px;
+            color: #ff6b6b;
+        }
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #7b68ee, #00d4aa);
+            color: white;
+            border: none;
+            padding: 15px 25px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 500;
+            box-shadow: 0 4px 15px rgba(123, 104, 238, 0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .refresh-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 20px rgba(123, 104, 238, 0.5);
+        }
+        .refresh-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #555;
+            font-size: 0.85em;
+        }
+        footer a {
+            color: #7b68ee;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Vibe Trading 数据看板</h1>
+        <p id="timestamp">加载中...</p>
+    </div>
+    
+    <div id="stats-container">
+        <div class="loading">
+            <div class="loading-spinner"></div>
+            <p style="margin-top: 15px;">正在获取最新数据...</p>
+        </div>
+    </div>
+    
+    <div id="charts-container"></div>
+    
+    <button class="refresh-btn" onclick="refreshData()">🔄 刷新数据</button>
+    
+    <footer>
+        数据来源：Binance, OKX, BitMart, Hyperliquid API | 
+        <a href="https://github.com" target="_blank">GitHub</a>
+    </footer>
+
+<script>
+// ============================================================================
+// 配置
+// ============================================================================
+
+const TIER_THRESHOLDS = [
+    [1e9, "T1 ≥1B"],
+    [3e8, "T2 300M–1B"],
+    [1e8, "T3 100M–300M"],
+    [3e7, "T4 30M–100M"],
+    [1e7, "T5 10M–30M"],
+    [3e6, "T6 3M–10M"],
+    [1e6, "T7 1M–3M"],
+    [3e5, "T8 300k–1M"],
+    [1e5, "T9 100k–300k"],
+    [0, "T10 <100k"],
+];
+
+const COLORS = {
+    "Binance": "#F0B90B",
+    "OKX": "#ffffff",
+    "BitMart": "#00D4AA",
+    "Hyperliquid": "#7B68EE",
+};
+
+const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+
+// ============================================================================
+// 工具函数
+// ============================================================================
+
+function getTier(volume) {
+    for (const [threshold, tierName] of TIER_THRESHOLDS) {
+        if (volume >= threshold) return tierName;
+    }
+    return "T10 <100k";
+}
+
+function formatNumber(num) {
+    if (num >= 1e9) return (num / 1e9).toFixed(2) + "B";
+    if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
+    if (num >= 1e3) return (num / 1e3).toFixed(2) + "K";
+    return num.toFixed(0);
+}
+
+async function fetchWithProxy(url, options = {}) {
+    try {
+        // 先尝试直接请求
+        const resp = await fetch(url, { ...options, mode: 'cors' });
+        if (resp.ok) return resp;
+    } catch (e) {
+        // 如果失败，使用代理
+        console.log(`Direct fetch failed for ${url}, using proxy...`);
+    }
+    return fetch(CORS_PROXY + encodeURIComponent(url), options);
+}
+
+// ============================================================================
+// 数据获取
+// ============================================================================
+
+async function fetchBinanceSpot() {
+    try {
+        const resp = await fetch("https://api.binance.com/api/v3/ticker/24hr");
+        const data = await resp.json();
+        return data
+            .filter(item => item.symbol.endsWith("USDT"))
+            .map(item => ({
+                symbol: item.symbol,
+                base: item.symbol.slice(0, -4),
+                volume: parseFloat(item.quoteVolume) || 0
+            }));
+    } catch (e) {
+        console.error("Binance Spot error:", e);
+        return [];
+    }
+}
+
+async function fetchBinanceFutures() {
+    try {
+        const resp = await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr");
+        const data = await resp.json();
+        return data
+            .filter(item => item.symbol.endsWith("USDT"))
+            .map(item => ({
+                symbol: item.symbol,
+                base: item.symbol.slice(0, -4),
+                volume: parseFloat(item.quoteVolume) || 0
+            }));
+    } catch (e) {
+        console.error("Binance Futures error:", e);
+        return [];
+    }
+}
+
+async function fetchOKXSpot() {
+    try {
+        const resp = await fetchWithProxy("https://www.okx.com/api/v5/market/tickers?instType=SPOT");
+        const json = await resp.json();
+        return (json.data || [])
+            .filter(item => item.instId.endsWith("-USDT"))
+            .map(item => ({
+                symbol: item.instId,
+                base: item.instId.split("-")[0],
+                volume: parseFloat(item.volCcy24h) || 0
+            }));
+    } catch (e) {
+        console.error("OKX Spot error:", e);
+        return [];
+    }
+}
+
+async function fetchOKXSwap() {
+    try {
+        const resp = await fetchWithProxy("https://www.okx.com/api/v5/market/tickers?instType=SWAP");
+        const json = await resp.json();
+        return (json.data || [])
+            .filter(item => item.instId.includes("-USDT-SWAP"))
+            .map(item => ({
+                symbol: item.instId,
+                base: item.instId.split("-")[0],
+                volume: (parseFloat(item.volCcy24h) || 0) * (parseFloat(item.last) || 0)
+            }));
+    } catch (e) {
+        console.error("OKX Swap error:", e);
+        return [];
+    }
+}
+
+async function fetchBitMartSpot() {
+    try {
+        const resp = await fetchWithProxy("https://api-cloud.bitmart.com/spot/quotation/v3/tickers");
+        const json = await resp.json();
+        return (json.data || [])
+            .filter(item => Array.isArray(item) && item[0].endsWith("_USDT"))
+            .map(item => ({
+                symbol: item[0],
+                base: item[0].slice(0, -5).replace(/^\$/, ""),
+                volume: parseFloat(item[3]) || 0
+            }));
+    } catch (e) {
+        console.error("BitMart Spot error:", e);
+        return [];
+    }
+}
+
+async function fetchBitMartFutures() {
+    try {
+        const resp = await fetchWithProxy("https://contract-v2.bitmart.com/v1/ifcontract/tickers");
+        const json = await resp.json();
+        const tickers = json.data?.tickers || [];
+        return tickers
+            .filter(item => item.contract_name?.endsWith("USDT"))
+            .map(item => ({
+                symbol: item.contract_name,
+                base: item.contract_name.slice(0, -4),
+                volume: parseFloat(item.amount24) || 0
+            }));
+    } catch (e) {
+        console.error("BitMart Futures error:", e);
+        return [];
+    }
+}
+
+async function fetchHyperliquidPerps() {
+    try {
+        const resp = await fetch("https://api.hyperliquid.xyz/info", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type: "metaAndAssetCtxs" })
+        });
+        const data = await resp.json();
+        const universe = data[0]?.universe || [];
+        const assetCtxs = data[1] || [];
+        return universe.map((asset, i) => ({
+            symbol: asset.name,
+            base: asset.name,
+            volume: parseFloat(assetCtxs[i]?.dayNtlVlm) || 0
+        }));
+    } catch (e) {
+        console.error("Hyperliquid Perps error:", e);
+        return [];
+    }
+}
+
+async function fetchHyperliquidSpot() {
+    try {
+        const resp = await fetch("https://api.hyperliquid.xyz/info", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type: "spotMetaAndAssetCtxs" })
+        });
+        const data = await resp.json();
+        if (!data || data.length < 2) return [];
+        const tokens = data[0]?.tokens || [];
+        const assetCtxs = data[1] || [];
+        return assetCtxs.map((ctx, i) => ({
+            symbol: tokens[i]?.name || `TOKEN${i}`,
+            base: tokens[i]?.name || `TOKEN${i}`,
+            volume: parseFloat(ctx.dayNtlVlm) || 0
+        }));
+    } catch (e) {
+        console.error("Hyperliquid Spot error:", e);
+        return [];
+    }
+}
+
+// ============================================================================
+// 数据处理
+// ============================================================================
+
+function calculateTierDistribution(tickers) {
+    const counts = {};
+    TIER_THRESHOLDS.forEach(([, name]) => counts[name] = 0);
+    tickers.forEach(t => counts[getTier(t.volume)]++);
+    return counts;
+}
+
+function calculateIntersection(data1, data2) {
+    const bases1 = new Set(data1.map(t => t.base.toUpperCase()));
+    const bases2 = new Set(data2.map(t => t.base.toUpperCase()));
+    return [...bases1].filter(b => bases2.has(b)).length;
+}
+
+// ============================================================================
+// 图表生成
+// ============================================================================
+
+function createTierChart(spotData, futuresData) {
+    const tierOrder = TIER_THRESHOLDS.map(t => t[1]);
+    const traces = [];
+    
+    // 现货
+    for (const [exchange, tickers] of Object.entries(spotData)) {
+        const dist = calculateTierDistribution(tickers);
+        traces.push({
+            name: `${exchange} 现货`,
+            x: tierOrder,
+            y: tierOrder.map(t => dist[t] || 0),
+            type: "bar",
+            marker: { color: COLORS[exchange] },
+            xaxis: "x",
+            yaxis: "y",
+        });
+    }
+    
+    // 合约
+    for (const [exchange, tickers] of Object.entries(futuresData)) {
+        const dist = calculateTierDistribution(tickers);
+        traces.push({
+            name: `${exchange} 合约`,
+            x: tierOrder,
+            y: tierOrder.map(t => dist[t] || 0),
+            type: "bar",
+            marker: { color: COLORS[exchange] },
+            xaxis: "x2",
+            yaxis: "y2",
+            showlegend: false,
+        });
+    }
+    
+    return {
+        data: traces,
+        layout: {
+            title: { text: "Tier 分布对比（按 24h 成交额分层）", font: { color: "#fff" } },
+            barmode: "group",
+            height: 450,
+            paper_bgcolor: "rgba(0,0,0,0)",
+            plot_bgcolor: "rgba(255,255,255,0.02)",
+            font: { color: "#888" },
+            legend: { orientation: "h", y: 1.12, font: { color: "#ccc" } },
+            grid: { rows: 1, columns: 2, pattern: "independent" },
+            xaxis: { domain: [0, 0.48], gridcolor: "rgba(255,255,255,0.05)" },
+            yaxis: { gridcolor: "rgba(255,255,255,0.05)" },
+            xaxis2: { domain: [0.52, 1], gridcolor: "rgba(255,255,255,0.05)" },
+            yaxis2: { gridcolor: "rgba(255,255,255,0.05)" },
+            annotations: [
+                { text: "现货", x: 0.24, y: 1.05, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+                { text: "合约", x: 0.76, y: 1.05, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+            ],
+        },
+    };
+}
+
+function createVolumeChart(spotData, futuresData) {
+    const spotVolumes = Object.entries(spotData).map(([name, tickers]) => ({
+        name,
+        volume: tickers.reduce((sum, t) => sum + t.volume, 0)
+    }));
+    const futuresVolumes = Object.entries(futuresData).map(([name, tickers]) => ({
+        name,
+        volume: tickers.reduce((sum, t) => sum + t.volume, 0)
+    }));
+    
+    return {
+        data: [
+            {
+                labels: spotVolumes.map(d => d.name),
+                values: spotVolumes.map(d => d.volume),
+                type: "pie",
+                hole: 0.4,
+                marker: { colors: spotVolumes.map(d => COLORS[d.name]) },
+                domain: { x: [0, 0.45] },
+                textinfo: "label+percent",
+                textfont: { color: "#fff" },
+            },
+            {
+                labels: futuresVolumes.map(d => d.name),
+                values: futuresVolumes.map(d => d.volume),
+                type: "pie",
+                hole: 0.4,
+                marker: { colors: futuresVolumes.map(d => COLORS[d.name]) },
+                domain: { x: [0.55, 1] },
+                textinfo: "label+percent",
+                textfont: { color: "#fff" },
+            }
+        ],
+        layout: {
+            title: { text: "24h 成交额占比", font: { color: "#fff" } },
+            height: 400,
+            paper_bgcolor: "rgba(0,0,0,0)",
+            font: { color: "#888" },
+            showlegend: false,
+            annotations: [
+                { text: "现货", x: 0.18, y: 0.5, font: { size: 16, color: "#aaa" }, showarrow: false },
+                { text: "合约", x: 0.82, y: 0.5, font: { size: 16, color: "#aaa" }, showarrow: false },
+            ],
+        },
+    };
+}
+
+function createTop10Chart(spotData, futuresData) {
+    const binanceSpotTop = [...(spotData.Binance || [])].sort((a, b) => b.volume - a.volume).slice(0, 10);
+    const binanceFuturesTop = [...(futuresData.Binance || [])].sort((a, b) => b.volume - a.volume).slice(0, 10);
+    
+    return {
+        data: [
+            {
+                x: binanceSpotTop.map(t => t.base),
+                y: binanceSpotTop.map(t => t.volume / 1e6),
+                type: "bar",
+                marker: { color: COLORS.Binance },
+                xaxis: "x",
+                yaxis: "y",
+            },
+            {
+                x: binanceFuturesTop.map(t => t.base),
+                y: binanceFuturesTop.map(t => t.volume / 1e6),
+                type: "bar",
+                marker: { color: COLORS.Binance },
+                xaxis: "x2",
+                yaxis: "y2",
+            }
+        ],
+        layout: {
+            title: { text: "Binance Top10 成交额（百万 USDT）", font: { color: "#fff" } },
+            height: 400,
+            paper_bgcolor: "rgba(0,0,0,0)",
+            plot_bgcolor: "rgba(255,255,255,0.02)",
+            font: { color: "#888" },
+            showlegend: false,
+            grid: { rows: 1, columns: 2, pattern: "independent" },
+            xaxis: { domain: [0, 0.48], gridcolor: "rgba(255,255,255,0.05)" },
+            yaxis: { gridcolor: "rgba(255,255,255,0.05)", title: "M USDT" },
+            xaxis2: { domain: [0.52, 1], gridcolor: "rgba(255,255,255,0.05)" },
+            yaxis2: { gridcolor: "rgba(255,255,255,0.05)" },
+            annotations: [
+                { text: "现货 Top10", x: 0.24, y: 1.05, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+                { text: "合约 Top10", x: 0.76, y: 1.05, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+            ],
+        },
+    };
+}
+
+function createIntersectionChart(spotData, futuresData) {
+    const spotExchanges = Object.keys(spotData);
+    const futuresExchanges = Object.keys(futuresData);
+    
+    const spotMatrix = spotExchanges.map(e1 => 
+        spotExchanges.map(e2 => 
+            e1 === e2 ? spotData[e1].length : calculateIntersection(spotData[e1], spotData[e2])
+        )
+    );
+    
+    const futuresMatrix = futuresExchanges.map(e1 => 
+        futuresExchanges.map(e2 => 
+            e1 === e2 ? futuresData[e1].length : calculateIntersection(futuresData[e1], futuresData[e2])
+        )
+    );
+    
+    return {
+        data: [
+            {
+                z: spotMatrix,
+                x: spotExchanges,
+                y: spotExchanges,
+                type: "heatmap",
+                colorscale: [[0, "#1a1a2e"], [1, "#00d4aa"]],
+                showscale: false,
+                text: spotMatrix.map(row => row.map(v => v.toString())),
+                texttemplate: "%{text}",
+                textfont: { color: "#fff" },
+                xaxis: "x",
+                yaxis: "y",
+            },
+            {
+                z: futuresMatrix,
+                x: futuresExchanges,
+                y: futuresExchanges,
+                type: "heatmap",
+                colorscale: [[0, "#1a1a2e"], [1, "#7b68ee"]],
+                showscale: false,
+                text: futuresMatrix.map(row => row.map(v => v.toString())),
+                texttemplate: "%{text}",
+                textfont: { color: "#fff" },
+                xaxis: "x2",
+                yaxis: "y2",
+            }
+        ],
+        layout: {
+            title: { text: "币种交集矩阵（对角线为自身数量）", font: { color: "#fff" } },
+            height: 400,
+            paper_bgcolor: "rgba(0,0,0,0)",
+            font: { color: "#888" },
+            grid: { rows: 1, columns: 2, pattern: "independent" },
+            xaxis: { domain: [0, 0.45] },
+            yaxis: {},
+            xaxis2: { domain: [0.55, 1] },
+            yaxis2: {},
+            annotations: [
+                { text: "现货交集", x: 0.22, y: 1.08, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+                { text: "合约交集", x: 0.77, y: 1.08, xref: "paper", yref: "paper", showarrow: false, font: { color: "#aaa", size: 14 } },
+            ],
+        },
+    };
+}
+
+// ============================================================================
+// 主函数
+// ============================================================================
+
+let isLoading = false;
+
+async function refreshData() {
+    if (isLoading) return;
+    isLoading = true;
+    
+    const btn = document.querySelector(".refresh-btn");
+    btn.disabled = true;
+    btn.textContent = "⏳ 加载中...";
+    
+    document.getElementById("stats-container").innerHTML = `
+        <div class="loading">
+            <div class="loading-spinner"></div>
+            <p style="margin-top: 15px;">正在获取最新数据...</p>
+        </div>
+    `;
+    document.getElementById("charts-container").innerHTML = "";
+    
+    try {
+        // 并行获取所有数据
+        const [
+            binanceSpot, binanceFutures,
+            okxSpot, okxSwap,
+            bitmartSpot, bitmartFutures,
+            hlSpot, hlPerps
+        ] = await Promise.all([
+            fetchBinanceSpot(),
+            fetchBinanceFutures(),
+            fetchOKXSpot(),
+            fetchOKXSwap(),
+            fetchBitMartSpot(),
+            fetchBitMartFutures(),
+            fetchHyperliquidSpot(),
+            fetchHyperliquidPerps(),
+        ]);
+        
+        const spotData = {
+            Binance: binanceSpot,
+            OKX: okxSpot,
+            BitMart: bitmartSpot,
+            Hyperliquid: hlSpot,
+        };
+        
+        const futuresData = {
+            Binance: binanceFutures,
+            OKX: okxSwap,
+            BitMart: bitmartFutures,
+            Hyperliquid: hlPerps,
+        };
+        
+        // 更新统计卡片
+        const statsHtml = `
+            <div class="stats-grid">
+                ${Object.entries(spotData).map(([name, tickers]) => `
+                    <div class="stat-card ${name.toLowerCase()}">
+                        <h3>${name} 现货</h3>
+                        <div class="value">${tickers.length}</div>
+                        <div class="sub">币种数量</div>
+                    </div>
+                `).join("")}
+                ${Object.entries(futuresData).map(([name, tickers]) => `
+                    <div class="stat-card ${name.toLowerCase()}">
+                        <h3>${name} 合约</h3>
+                        <div class="value">${tickers.length}</div>
+                        <div class="sub">币种数量</div>
+                    </div>
+                `).join("")}
+            </div>
+        `;
+        document.getElementById("stats-container").innerHTML = statsHtml;
+        
+        // 生成图表
+        const charts = [
+            createTierChart(spotData, futuresData),
+            createVolumeChart(spotData, futuresData),
+            createTop10Chart(spotData, futuresData),
+            createIntersectionChart(spotData, futuresData),
+        ];
+        
+        const chartsHtml = charts.map((_, i) => `
+            <div class="chart-container">
+                <div id="chart_${i}"></div>
+            </div>
+        `).join("");
+        document.getElementById("charts-container").innerHTML = chartsHtml;
+        
+        charts.forEach((chart, i) => {
+            Plotly.newPlot(`chart_${i}`, chart.data, chart.layout, { responsive: true });
+        });
+        
+        // 更新时间戳
+        document.getElementById("timestamp").textContent = 
+            `数据更新时间: ${new Date().toLocaleString("zh-CN")}`;
+        
+    } catch (e) {
+        console.error("Error:", e);
+        document.getElementById("stats-container").innerHTML = `
+            <div class="error-msg">
+                数据加载失败，请稍后重试。错误: ${e.message}
+            </div>
+        `;
+    }
+    
+    btn.disabled = false;
+    btn.textContent = "🔄 刷新数据";
+    isLoading = false;
+}
+
+// 页面加载时自动获取数据
+document.addEventListener("DOMContentLoaded", refreshData);
+</script>
+</body>
+</html>
