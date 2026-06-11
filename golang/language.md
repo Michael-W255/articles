@@ -1,3 +1,18 @@
+# goroutine 泄漏的常见原因
+
+核心:**goroutine 进入永久阻塞或永久运行,没有退出路径。**
+
+1. **channel 发送阻塞** —— 没有接收方,卡在 `ch <- v`。
+2. **channel 接收阻塞** —— 没有发送方(发送方提前退出或忘了关 channel),卡在 `<-ch`。
+3. **context 没用** —— 没传取消信号,或 goroutine 没监听 `ctx.Done()`,父任务结束子 goroutine 还在跑。
+4. **select 全分支阻塞** —— 所有 channel 都不就绪,又没有 default 或 `ctx.Done()` 退出分支。
+5. **WaitGroup 计数不匹配** —— Add/Done 对不上,Wait 永不归零。
+6. **无限循环无退出条件** —— `for {}` 里没有 break/return/ctx 检查,空转。
+7. **锁/IO 阻塞无超时** —— 锁没释放、网络或 DB 调用没设超时,对端不响应就一直挂着。
+
+**排查**:pprof 看 goroutine 数量是否持续增长、卡在哪一行, 两次pprof 对比
+**预防**:凡是会阻塞的操作,都要问一句"能否正常退出?"——用 context、select + ctx.Done()、设超时、defer Unlock、保证 channel 有人收发
+
 # 函数传参是引用值类型还是引用类型
 都是引用类型, 如果是指针就是拷贝新的指针指向值类型; 如果是值就是值拷贝.
 
@@ -531,13 +546,31 @@ trace 记录了运行时的信息，能提供可视化的 Web 页面。
 
 ​ 当本线程因为 G 进行系统调用阻塞时，线程释放绑定的 P，把 P 转移给其他空闲的线程执行。充分利用cpu
 
+### GMP 简要介绍
+* G(Goroutine):协程,Go 的并发执行单元,栈很小(2KB 起,可伸缩),创建和切换成本低。
+
+* M(Machine):系统线程,真正执行代码的实体,由 OS 调度。
+
+* P(Processor):逻辑处理器,持有可运行 G 的本地队列,M 必须绑定 P 才能执行 G。P 的数量由 GOMAXPROCS 决定,默认等于 CPU 核数。
+
+* 核心关系
+
+P 是 G 和 M 之间的桥梁。M 要执行 G,必须先拿到一个 P,从 P 的本地队列里取 G 来跑。所以真正的并行度由 P 的数量决定
+
+#### 为什么这样设计(优势)
+
+* 早期是 GM 模型(只有全局队列 + 全局锁),锁竞争严重;引入 P 后有了本地队列,大幅减少锁竞争。
+
+* goroutine 轻量 + 用户态调度,切换不陷入内核,几十万 goroutine 也能轻松跑。
+
+* work stealing + hand off 保证了负载均衡和阻塞不阻塞整体。
+
 ### 创建一个goroutine 如何执行
 ![image](https://github.com/user-attachments/assets/408947c5-598b-4fd3-8fc4-a4fcb00a2828)
 1. 创建一个G 时先放P 的本地队列, 本地队列放不下, 放全局队列
 2. 每个P和一个M绑定，M是真正的执行P中goroutine的实体(流程3)，M从绑定的P中的局部队列获取G来执行
 3. 当M绑定的P的局部队列为空时，M会从全局队列获取到本地队列来执行G(流程3.1)，当从全局队列中没有获取到可执行的G时候，M会从其他P的局部队列中偷取G来执行(流程3.2)，这种从其他P偷的方式称为work stealing
-4. 当G阻塞(因系统调用 syscall)时会阻塞M，此时P会和M解绑即hand off，并寻找新的idle的M 来继续执行P 中剩余得G ，若没有idle的M就会新建一个M(流程5.1)。
-5. 当阻塞的G恢复后会重新进入runnable进入P队列等待执行(流程5.3)
+4. 当G阻塞(因系统调用 syscall)时会阻塞M，此时P会和M解绑即hand off，并寻找新的idle的M 来继续执行P 中剩余得G ，若没有idle的M就会新建一个M(流程5.1)。当阻塞的G恢复后会重新进入runnable进入P队列等待执行(流程5.3)
 
 
 # debug
@@ -664,9 +697,83 @@ because [Michael Jones explained this well](https://groups.google.com/d/msg/gola
 
 send 和 receive 在一个 unbuffered channel, 会互相阻塞, 例如若没有 goroutine 在 receive , send 会阻塞, 反之亦然
 
+### channel 实现原理
+简要介绍(说重点)
+channel 底层是一个 hchan 结构体,核心由三部分组成:
+
+* 环形缓冲区(ring buffer):有缓冲 channel 用的循环队列,存数据。
+
+* 两个等待队列(sendq / recvq):存放被阻塞的发送方和接收方 goroutine(用 sudog 封装)。
+
+* 一把互斥锁(lock):保护整个 channel 的并发操作。
+
+收发数据时先抢锁,再决定是直接传递、放进缓冲、还是阻塞入队。channel 不是无锁的,而是加锁的队列 + goroutine 阻塞唤醒机制。
+
+#### 可能被追问的细节
+1. 无缓冲 channel 怎么传数据?
+无缓冲(dataqsiz=0)没有 buf,发送和接收必须同步配对:一方先到就阻塞入队,另一方到了直接内存拷贝 + 唤醒。所以是强同步通信。
+
+2. 直接拷贝优化(关键点)
+有接收方在等时,发送方直接把数据拷到接收方的栈上,不经过缓冲区,省一次拷贝。这是 channel 高效的原因之一。
+
+3. close 做了什么?
+关闭时加锁,设置 closed 标志,然后唤醒 sendq 和 recvq 里所有阻塞的 goroutine。接收方被唤醒后读到零值(ok=false),发送方被唤醒会 panic。
+
+4. close 的几个 panic 点
+
+关闭已关闭的 channel → panic。
+向已关闭的 channel 发送 → panic。
+关闭 nil channel → panic。
+(读已关闭 channel 是安全的,返回零值。)
+
+5. 读写 nil channel 会怎样?
+永久阻塞。常用于 select 中"动态禁用"某个 case。
+
+6. goroutine 阻塞唤醒的本质
+阻塞时调用 gopark 让出 M,goroutine 状态变 waiting,M 去跑别的 G(不会阻塞线程);被唤醒时 goready 把它重新放回运行队列。channel 阻塞不会阻塞底层线程,这是和锁的重要区别。
+
+7. sudog 是什么?
+封装一个等待中的 goroutine 及其要收发的数据元素,挂在 sendq/recvq 上,是连接 channel 和 goroutine 调度的桥梁。
+
+8. select 怎么实现的?
+多个 case 会随机打乱顺序避免饥饿,逐个尝试加锁检查能否立即收发;都不行就把当前 goroutine 同时挂到所有相关 channel 的等待队列上,任一就绪即被唤醒,再从其他队列摘除。
+
+9. channel 是 happens-before 的吗?
+是。发送 happens-before 对应的接收完成;close happens-before 因 close 而返回的接收。这是 channel 能安全传递数据的内存模型保证。
 
 ## sync map
-sync map 实际是以空间换时间, 适合读多写少的场景, 有read 和dirty 两个map 结构. 读取不需要加锁. 
+sync.Map 是 Go 提供的并发安全 map,核心设计是读写分离 + 空间换时间,用两个 map 来减少锁竞争:
+
+read(只读 map):atomic.Value 存储,读操作走这里完全无锁(原子读),性能极高。
+dirty(脏 map):普通 map + Mutex 保护,存放新写入的、read 里还没有的 key。
+
+读的时候先无锁查 read,命中直接返回;没命中(且可能在 dirty 里)才加锁去查 dirty。这样读多写少场景下,绝大多数读都不用加锁。
+适用场景:读多写少、key 集合相对稳定。写多或 key 频繁变化时,性能反而不如 map + RWMutex
+
+1. 为什么用两个 map?
+为了让读尽量无锁。如果只有一个 map 加锁,读写都要抢锁。拆成 read/dirty 后,稳定的 key 都在 read 里,读直接原子操作,锁只在涉及 dirty 时才用。
+2. read 和 dirty 怎么同步的(misses 机制)?
+read 里查不到 key 时,会去 dirty 查,同时 misses 计数 +1。当 misses 累积到 ≥ len(dirty) 时,触发提升(promote):把整个 dirty 直接升级为新的 read,dirty 置空。这样高频访问的 key 最终都会沉淀到无锁的 read 里。
+3. entry 的三种状态(关键点)
+每个 value 用 entry 指针封装,有三种状态:
+
+正常值:指向真实数据。
+nil:key 被删除,但 dirty 已重建,此 entry 还留在 read 里(软删除)。
+expunged(已删除标记):特殊指针,表示该 key 在 read 中被删且不在 dirty 里。重建 dirty 时,nil 会被标记成 expunged,避免被复制进新 dirty。
+
+4. 删除为什么用"标记删除"而不是真删?
+如果 key 在 read 里,删除只是把 entry 的值原子置为 nil(无锁软删除),不立即从 map 摘除。真正清理发生在下次 dirty 重建时。这样删除也能走无锁路径。
+5. dirty 是怎么重建的?
+当一个新 key 第一次写入(read 和 dirty 都没有)时,如果 dirty 为 nil,会把 read 中所有未删除的 entry 拷贝到新 dirty,然后再写入新 key。这个拷贝是 O(n) 的,是 sync.Map 写入的主要开销来源。
+6. 为什么写多场景性能差?
+
+每次写新 key 可能触发 dirty 重建(全量拷贝)。
+写操作要加锁。
+频繁 promote 也有成本。
+所以写密集时不如直接 RWMutex + map。
+
+7. 和 RWMutex+map 的本质区别
+RWMutex 读也要加读锁(虽然多读可并发,但有锁开销和写饥饿问题);sync.Map 的读在命中 read 时是纯原子操作,零锁,这是它在读多场景的核心优势
 
 * 读取过程
 
